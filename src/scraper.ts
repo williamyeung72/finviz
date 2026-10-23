@@ -241,6 +241,199 @@ export function parseScreenerTable(html: string): ScreenerRow[] {
   return rows;
 }
 
+// ---------------------------------------------------------------------------
+// 2b. Map bundle — S&P 500 sector / industry / market cap
+//
+// Finviz replaced the screener HTML table with a client-rendered SPA, so
+// `screener.ashx` no longer contains `<tr>` rows. The S&P 500 map page still
+// ships a static bundle (chunk id `map_base_sec`) with the full constituent
+// tree: sector → industry → ticker, plus market cap in millions of dollars.
+// ---------------------------------------------------------------------------
+
+interface MapTreeNode {
+  name: string;
+  description?: string;
+  value?: number;
+  children?: MapTreeNode[];
+}
+
+/** Pull the `{name:"Root",children:[...]}` literal out of the map bundle. */
+function parseMapTreeLiteral(js: string): MapTreeNode {
+  const marker = '{name:"Root",children:';
+  const start = js.indexOf(marker);
+  if (start < 0) {
+    throw new Error("Finviz map bundle is missing the S&P 500 constituent tree");
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let end = -1;
+  for (let i = start; i < js.length; i++) {
+    const ch = js[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i + 1;
+        break;
+      }
+    }
+  }
+  if (end < 0) throw new Error("Finviz map bundle tree was truncated");
+
+  // The literal is a JS object with identifier keys and JSON string/number values.
+  const literal = js.slice(start, end);
+  const json = literal.replace(/([\{,])([A-Za-z_][A-Za-z0-9_]*):/g, '$1"$2":');
+  return JSON.parse(json) as MapTreeNode;
+}
+
+/**
+ * Map bundles report market cap in millions of dollars (AAPL is a few million
+ * of those units, i.e. trillions of dollars). A value already in raw dollars
+ * is orders of magnitude larger and is left alone.
+ */
+function mapMarketCapToDollars(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return 0;
+  return value < 1e9 ? value * 1e6 : value;
+}
+
+function stocksFromMapTree(root: MapTreeNode): ScreenerStock[] {
+  const stocks: ScreenerStock[] = [];
+  const validSectors = new Set(Object.values(ETF_SECTOR_MAP));
+
+  const walk = (node: MapTreeNode, sector?: string, industry?: string) => {
+    if (node.children && node.children.length > 0) {
+      for (const child of node.children) {
+        if (!sector) walk(child, child.name);
+        else if (!industry) walk(child, sector, child.name);
+        else walk(child, sector, industry);
+      }
+      return;
+    }
+    if (!sector || !validSectors.has(sector)) return;
+
+    const ticker = node.name.trim().toUpperCase();
+    if (!/^[A-Z0-9.\-]{1,10}$/.test(ticker)) return;
+    stocks.push({
+      ticker,
+      company: node.description?.trim() || ticker,
+      sector,
+      industry: industry ?? "",
+      marketCap: mapMarketCapToDollars(node.value),
+    });
+  };
+
+  walk(root);
+  return stocks;
+}
+
+function mapBaseScriptUrl(html: string): string {
+  const tags = html.match(/<link\b[^>]*>/gi) ?? [];
+  for (const tag of tags) {
+    if (!tag.includes('data-chunk-id="map_base_sec"')) continue;
+    const href = tag.match(/\bhref="([^"]+)"/);
+    if (!href) continue;
+    const path = href[1];
+    if (path.startsWith("http://") || path.startsWith("https://")) return path;
+    return `${BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
+  }
+  throw new Error("Finviz map page did not reference the map_base_sec bundle");
+}
+
+async function fetchSectorMappingFromMap(): Promise<Map<string, ScreenerStock>> {
+  const page = await fetchWithRetry(`${BASE_URL}/map?t=sec`);
+  const scriptUrl = mapBaseScriptUrl(await page.text());
+  const script = await fetchWithRetry(scriptUrl);
+  const stocks = stocksFromMapTree(parseMapTreeLiteral(await script.text()));
+  const mapping = new Map<string, ScreenerStock>();
+  for (const stock of stocks) mapping.set(stock.ticker, stock);
+  return mapping;
+}
+
+// ---------------------------------------------------------------------------
+// 2c. Quote snapshot — ETF performance + technicals
+//
+// Individual quote pages still render a label/value snapshot table. That is
+// the fallback when the screener SPA returns no rows (sector ETFs, asset-class
+// ETFs, and the technical view all used to come from screener HTML).
+// ---------------------------------------------------------------------------
+
+const quoteCache = new Map<string, Map<string, string>>();
+
+/** Last percent in a snapshot cell. "203.25 -10.29%" → -10.29; "1.82%" → 1.82. */
+function parsePctLoose(raw: string): number {
+  const normalized = raw.replace(/[\u2212\u2012-\u2015]/g, "-");
+  const matches = [...normalized.matchAll(/(-?\d+(?:\.\d+)?)\s*%/g)];
+  if (matches.length > 0) return parseFloat(matches[matches.length - 1][1]);
+  return parseNumeric(normalized);
+}
+
+export function parseQuoteSnapshot(html: string): Map<string, string> {
+  const $ = cheerio.load(html);
+  const fields = new Map<string, string>();
+  $(".snapshot-td-label").each((_, el) => {
+    const label = normalizeLabel($(el).text());
+    if (!label || fields.has(label)) return;
+    const value = $(el).closest("td").next("td").text().replace(/\s+/g, " ").trim();
+    fields.set(label, value);
+  });
+  return fields;
+}
+
+function snapshotGet(fields: Map<string, string>, ...labels: string[]): string {
+  for (const label of labels) {
+    const key = normalizeLabel(label);
+    if (!key) continue;
+    const exact = fields.get(key);
+    if (exact !== undefined) return exact;
+    for (const [candidate, value] of fields) {
+      if (candidate.startsWith(key)) return value;
+    }
+  }
+  return "";
+}
+
+async function fetchQuoteSnapshot(ticker: string): Promise<Map<string, string>> {
+  const cached = quoteCache.get(ticker);
+  if (cached) return cached;
+
+  const url = `${BASE_URL}/quote.ashx?t=${encodeURIComponent(ticker)}`;
+  let lastSize = 0;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await fetchWithRetry(url);
+    const fields = parseQuoteSnapshot(await res.text());
+    lastSize = fields.size;
+    // A real quote snapshot has dozens of fundamentals. An empty or challenge
+    // page does not, so retry rather than caching a miss.
+    if (fields.size >= 10) {
+      quoteCache.set(ticker, fields);
+      await sleep(250);
+      return fields;
+    }
+    if (attempt < 3) await sleep(1000 * attempt);
+  }
+  throw new Error(`Quote snapshot for ${ticker} had ${lastSize} fields after 3 attempts`);
+}
+
+/** One screener fetch. Empty SPA / block becomes [] so callers can fall back. */
+async function tryScreenerRows(url: string): Promise<ScreenerRow[]> {
+  try {
+    const res = await fetchWithRetry(url, 1);
+    return parseScreenerTable(await res.text());
+  } catch (err) {
+    console.warn(`  ⚠ Screener unavailable: ${err instanceof Error ? err.message : err}`);
+    return [];
+  }
+}
+
 async function fetchScreenerPage(offset: number): Promise<ScreenerStock[]> {
   const url = `${SCREENER_URL}?v=152&f=idx_sp500&r=${offset}`;
   const validSectors = new Set(Object.values(ETF_SECTOR_MAP));
@@ -278,6 +471,21 @@ async function fetchScreenerPage(offset: number): Promise<ScreenerStock[]> {
 }
 
 export async function fetchSectorMapping(): Promise<Map<string, ScreenerStock>> {
+  try {
+    const fromMap = await fetchSectorMappingFromMap();
+    if (fromMap.size > 400) {
+      console.log(`  Fetched sector mapping for ${fromMap.size} stocks (map bundle)`);
+      return fromMap;
+    }
+    console.warn(
+      `  ⚠ Map bundle returned only ${fromMap.size} stocks; falling back to screener HTML`
+    );
+  } catch (err) {
+    console.warn(
+      `  ⚠ Map bundle sector mapping failed (${err instanceof Error ? err.message : err}); falling back to screener HTML`
+    );
+  }
+
   const allStocks = new Map<string, ScreenerStock>();
   const totalPages = 26; // 503 stocks, 20 per page
 
@@ -302,25 +510,59 @@ export async function fetchSectorMapping(): Promise<Map<string, ScreenerStock>> 
 // 3. Sector ETFs — single page fetch
 // ---------------------------------------------------------------------------
 
+function sectorEtfFromRow(row: ScreenerRow): SectorETF | null {
+  if (!(row.ticker in ETF_SECTOR_MAP)) return null;
+  return {
+    ticker: row.ticker,
+    sector: ETF_SECTOR_MAP[row.ticker],
+    perf1W: parsePct(row.get("Perf Week")),
+    perf1M: parsePct(row.get("Perf Month")),
+    perf3M: parsePct(row.get("Perf Quart", "Perf Quarter")),
+    avgVolume: parseVolume(row.get("Avg Volume", "Average Volume")),
+    relVolume: parseNumeric(row.get("Rel Volume", "Relative Volume"), 1),
+    price: parseNumeric(row.get("Price")),
+  };
+}
+
+async function sectorEtfFromQuote(ticker: string): Promise<SectorETF> {
+  const snap = await fetchQuoteSnapshot(ticker);
+  const etf: SectorETF = {
+    ticker,
+    sector: ETF_SECTOR_MAP[ticker],
+    perf1W: parsePctLoose(snapshotGet(snap, "Perf Week")),
+    perf1M: parsePctLoose(snapshotGet(snap, "Perf Month")),
+    perf3M: parsePctLoose(snapshotGet(snap, "Perf Quart", "Perf Quarter")),
+    avgVolume: parseVolume(snapshotGet(snap, "Avg Volume", "Average Volume")),
+    relVolume: parseNumeric(snapshotGet(snap, "Rel Volume", "Relative Volume"), 1),
+    price: parseNumeric(snapshotGet(snap, "Price")),
+  };
+  if (!(etf.price > 0)) {
+    throw new Error(`Quote snapshot for ${ticker} did not include a price`);
+  }
+  return etf;
+}
+
 export async function fetchSectorETFs(): Promise<SectorETF[]> {
   const url = `${SCREENER_URL}?v=140&t=${SECTOR_ETF_TICKERS}`;
-  const res = await fetchWithRetry(url);
-
-  const etfs: SectorETF[] = [];
-  for (const row of parseScreenerTable(await res.text())) {
-    if (!(row.ticker in ETF_SECTOR_MAP)) continue;
-
-    etfs.push({
-      ticker: row.ticker,
-      sector: ETF_SECTOR_MAP[row.ticker],
-      perf1W: parsePct(row.get("Perf Week")),
-      perf1M: parsePct(row.get("Perf Month")),
-      perf3M: parsePct(row.get("Perf Quart", "Perf Quarter")),
-      avgVolume: parseVolume(row.get("Avg Volume", "Average Volume")),
-      relVolume: parseNumeric(row.get("Rel Volume", "Relative Volume"), 1),
-      price: parseNumeric(row.get("Price")),
-    });
+  const byTicker = new Map<string, SectorETF>();
+  for (const row of await tryScreenerRows(url)) {
+    const etf = sectorEtfFromRow(row);
+    if (etf) byTicker.set(etf.ticker, etf);
   }
+
+  const missing = Object.keys(ETF_SECTOR_MAP).filter((ticker) => !byTicker.has(ticker));
+  if (missing.length > 0) {
+    console.warn(
+      `  ⚠ Sector ETF screener returned ${byTicker.size}/${Object.keys(ETF_SECTOR_MAP).length}; filling ${missing.length} from quote pages`
+    );
+    for (const ticker of missing) {
+      byTicker.set(ticker, await sectorEtfFromQuote(ticker));
+    }
+  }
+
+  const etfs = Object.keys(ETF_SECTOR_MAP)
+    .map((ticker) => byTicker.get(ticker))
+    .filter((etf): etf is SectorETF => etf !== undefined);
 
   console.log(`  Fetched ${etfs.length} sector ETFs`);
   const expected = Object.keys(ETF_SECTOR_MAP).length;
@@ -358,26 +600,53 @@ const ASSET_CLASS_ETF_MAP: Record<string, { assetClass: string; label: string }>
 
 const ASSET_CLASS_TICKERS = Object.keys(ASSET_CLASS_ETF_MAP).join(",");
 
+function assetClassEtfFromRow(row: ScreenerRow): AssetClassETF | null {
+  const info = ASSET_CLASS_ETF_MAP[row.ticker];
+  if (!info) return null;
+  return {
+    ticker: row.ticker,
+    assetClass: info.assetClass,
+    label: info.label,
+    perf1W: parsePct(row.get("Perf Week")),
+    perf1M: parsePct(row.get("Perf Month")),
+    perf3M: parsePct(row.get("Perf Quart", "Perf Quarter")),
+    relVolume: parseNumeric(row.get("Rel Volume", "Relative Volume"), 1),
+  };
+}
+
+async function assetClassEtfFromQuote(ticker: string): Promise<AssetClassETF> {
+  const info = ASSET_CLASS_ETF_MAP[ticker];
+  const snap = await fetchQuoteSnapshot(ticker);
+  return {
+    ticker,
+    assetClass: info.assetClass,
+    label: info.label,
+    perf1W: parsePctLoose(snapshotGet(snap, "Perf Week")),
+    perf1M: parsePctLoose(snapshotGet(snap, "Perf Month")),
+    perf3M: parsePctLoose(snapshotGet(snap, "Perf Quart", "Perf Quarter")),
+    relVolume: parseNumeric(snapshotGet(snap, "Rel Volume", "Relative Volume"), 1),
+  };
+}
+
 export async function fetchAssetClassETFs(): Promise<AssetClassETF[]> {
   const url = `${SCREENER_URL}?v=140&t=${ASSET_CLASS_TICKERS}`;
-  const res = await fetchWithRetry(url);
-
-  const etfs: AssetClassETF[] = [];
-  for (const row of parseScreenerTable(await res.text())) {
-    const info = ASSET_CLASS_ETF_MAP[row.ticker];
-    if (!info) continue;
-
-    etfs.push({
-      ticker: row.ticker,
-      assetClass: info.assetClass,
-      label: info.label,
-      perf1W: parsePct(row.get("Perf Week")),
-      perf1M: parsePct(row.get("Perf Month")),
-      perf3M: parsePct(row.get("Perf Quart", "Perf Quarter")),
-      relVolume: parseNumeric(row.get("Rel Volume", "Relative Volume"), 1),
-    });
+  const byTicker = new Map<string, AssetClassETF>();
+  for (const row of await tryScreenerRows(url)) {
+    const etf = assetClassEtfFromRow(row);
+    if (etf) byTicker.set(etf.ticker, etf);
   }
 
+  const missing = Object.keys(ASSET_CLASS_ETF_MAP).filter((ticker) => !byTicker.has(ticker));
+  if (missing.length > 0) {
+    console.warn(
+      `  ⚠ Asset class ETF screener returned ${byTicker.size}/${Object.keys(ASSET_CLASS_ETF_MAP).length}; filling ${missing.length} from quote pages`
+    );
+    for (const ticker of missing) {
+      byTicker.set(ticker, await assetClassEtfFromQuote(ticker));
+    }
+  }
+
+  const etfs = [...byTicker.values()];
   console.log(`  Fetched ${etfs.length} asset class ETFs`);
   if (etfs.length === 0) {
     throw new Error("Asset class ETF screener returned no rows");
@@ -389,34 +658,59 @@ export async function fetchAssetClassETFs(): Promise<AssetClassETF[]> {
 // 4b. Technical Data — SMA distances + RSI for trend phase classification
 // ---------------------------------------------------------------------------
 
+function technicalFromRow(row: ScreenerRow): TechnicalData {
+  return {
+    ticker: row.ticker,
+    sma20: parsePct(row.get("SMA20", "SMA 20")),
+    sma50: parsePct(row.get("SMA50", "SMA 50")),
+    sma200: parsePct(row.get("SMA200", "SMA 200")),
+    from52WHigh: parsePctLoose(row.get("52W High", "52-Week High")),
+    from52WLow: parsePctLoose(row.get("52W Low", "52-Week Low")),
+    rsi: parseNumeric(row.get("RSI", "Relative Strength Index"), 50),
+  };
+}
+
+function technicalFromSnapshot(ticker: string, snap: Map<string, string>): TechnicalData {
+  return {
+    ticker,
+    sma20: parsePctLoose(snapshotGet(snap, "SMA20", "SMA 20")),
+    sma50: parsePctLoose(snapshotGet(snap, "SMA50", "SMA 50")),
+    sma200: parsePctLoose(snapshotGet(snap, "SMA200", "SMA 200")),
+    from52WHigh: parsePctLoose(snapshotGet(snap, "52W High", "52-Week High")),
+    from52WLow: parsePctLoose(snapshotGet(snap, "52W Low", "52-Week Low")),
+    rsi: parseNumeric(snapshotGet(snap, "RSI", "Relative Strength Index"), 50),
+  };
+}
+
 export async function fetchTechnicalData(tickers: string[]): Promise<Map<string, TechnicalData>> {
   const results = new Map<string, TechnicalData>();
 
-  // Finviz screener paginates at 20 rows — split into batches to ensure we get all
+  // Finviz screener paginates at 20 rows — split into batches to ensure we get all.
+  // A redesigned screener page has no table; stop paging and fill the rest from quotes.
   const BATCH_SIZE = 20;
-  for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
+  let screenerAlive = true;
+  for (let i = 0; screenerAlive && i < tickers.length; i += BATCH_SIZE) {
     const batch = tickers.slice(i, i + BATCH_SIZE);
     const tickerStr = batch.join(",");
     // v=171 = Technical view: No, Ticker, Beta, ATR, SMA20, SMA50, SMA200, 52W High, 52W Low, RSI, ...
     const url = `${SCREENER_URL}?v=171&t=${tickerStr}`;
-    const res = await fetchWithRetry(url);
-
-    for (const row of parseScreenerTable(await res.text())) {
-      if (!batch.includes(row.ticker)) continue;
-
-      results.set(row.ticker, {
-        ticker: row.ticker,
-        sma20: parsePct(row.get("SMA20", "SMA 20")),
-        sma50: parsePct(row.get("SMA50", "SMA 50")),
-        sma200: parsePct(row.get("SMA200", "SMA 200")),
-        from52WHigh: parsePct(row.get("52W High", "52-Week High")),
-        from52WLow: parsePct(row.get("52W Low", "52-Week Low")),
-        rsi: parseNumeric(row.get("RSI", "Relative Strength Index"), 50),
-      });
+    const rows = (await tryScreenerRows(url)).filter((row) => batch.includes(row.ticker));
+    if (rows.length === 0) {
+      screenerAlive = false;
+      break;
     }
+    for (const row of rows) results.set(row.ticker, technicalFromRow(row));
+    if (i + BATCH_SIZE < tickers.length) await sleep(300);
+  }
 
-    if (i + BATCH_SIZE < tickers.length) {
-      await sleep(300);
+  const missing = tickers.filter((ticker) => !results.has(ticker));
+  if (missing.length > 0) {
+    console.warn(
+      `  ⚠ Technical screener missed ${missing.length}/${tickers.length} tickers; filling from quote pages`
+    );
+    for (const ticker of missing) {
+      const snap = await fetchQuoteSnapshot(ticker);
+      results.set(ticker, technicalFromSnapshot(ticker, snap));
     }
   }
 
